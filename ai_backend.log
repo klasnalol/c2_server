@@ -1,0 +1,12 @@
+AI backend listening on 0.0.0.0:8090 provider=ollama model=llama3.1:8b
+ * Serving Flask app 'ai_detection_backend'
+ * Debug mode: off
+[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:8090
+ * Running on http://192.168.8.53:8090
+[33mPress CTRL+C to quit[0m
+127.0.0.1 - - [06/Apr/2026 10:03:26] "GET /status HTTP/1.1" 200 -
+127.0.0.1 - - [06/Apr/2026 10:03:31] "GET /status HTTP/1.1" 200 -
+127.0.0.1 - - [06/Apr/2026 10:03:40] "POST /analyze HTTP/1.1" 200 -
+127.0.0.1 - - [06/Apr/2026 10:03:43] "POST /analyze HTTP/1.1" 200 -
