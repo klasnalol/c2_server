@@ -3,6 +3,7 @@
 
 C2_DIR="$(cd "$(dirname "$0")" && pwd)"
 SERVER_PID=$(pgrep -f "python3.*c2_server.py")
+AI_PID=$(pgrep -f "python3.*ai_detection_backend.py")
 
 case "$1" in
     start)
@@ -16,12 +17,31 @@ case "$1" in
             echo "Dashboard: http://$(hostname -I | awk '{print $1}'):8080/dashboard"
         fi
         ;;
+    ai-start)
+        if [ -n "$AI_PID" ]; then
+            echo "AI Backend already running (PID: $AI_PID)"
+        else
+            cd $C2_DIR
+            nohup python3 ai_detection_backend.py > ai_backend.log 2>&1 &
+            sleep 2
+            echo "AI Backend started (PID: $!)"
+            echo "Endpoint: http://$(hostname -I | awk '{print $1}'):8090/status"
+        fi
+        ;;
     stop)
         if [ -n "$SERVER_PID" ]; then
             kill $SERVER_PID
             echo "C2 Server stopped"
         else
             echo "C2 Server not running"
+        fi
+        ;;
+    ai-stop)
+        if [ -n "$AI_PID" ]; then
+            kill $AI_PID
+            echo "AI Backend stopped"
+        else
+            echo "AI Backend not running"
         fi
         ;;
     status)
@@ -34,6 +54,14 @@ case "$1" in
         ;;
     logs)
         tail -f $C2_DIR/logs/c2_log.json 2>/dev/null || echo "No logs yet"
+        ;;
+    ai-status)
+        if [ -n "$AI_PID" ]; then
+            echo "AI Backend is running (PID: $AI_PID)"
+            curl -s http://localhost:8090/status | python3 -m json.tool 2>/dev/null || echo "AI backend not responding"
+        else
+            echo "AI Backend is not running"
+        fi
         ;;
     compare)
         cd $C2_DIR
@@ -64,7 +92,7 @@ case "$1" in
         fi
         ;;
     *)
-        echo "Usage: $0 {start|stop|status|logs|compare|import-manual <file>|dashboard|clean}"
+        echo "Usage: $0 {start|stop|status|logs|compare|import-manual <file>|dashboard|clean|ai-start|ai-stop|ai-status}"
         exit 1
         ;;
 esac

@@ -13,7 +13,8 @@ import re
 import uuid
 from pathlib import Path
 from flask import Flask, request, send_file, jsonify, render_template_string
-from flag_detection import compare_detection, summarize_detection
+from ai_backend_client import analyze_with_backend
+from flag_detection import manual_detect, summarize_detection
 
 app = Flask(__name__)
 
@@ -26,6 +27,8 @@ DEFAULT_CONFIG = {
     "payload_dir": "payloads",
     "log_dir": "logs",
     "flags_dir": "flags_received",
+    "ai_backend_url": "http://127.0.0.1:8090/analyze",
+    "ai_backend_timeout_seconds": 8,
     "host_ip": None          # Will auto-detect
 }
 
@@ -95,12 +98,36 @@ def _event_key(entry):
 
 def apply_detection_fields(entry, labels):
     entry = dict(entry)
-    comparison = compare_detection(entry.get("details", ""))
+    details = entry.get("details", "")
+    event_id = entry.get("event_id", "")
+    manual = manual_detect(details)
 
-    # AI side is always automated.
-    entry["ai_detected"] = comparison["ai"]["detected"]
-    entry["ai_score"] = comparison["ai"]["score"]
-    entry["ai_reasons"] = comparison["ai"]["reasons"]
+    # AI side is provided by separate backend app.
+    if "ai_detected" in entry and "ai_score" in entry:
+        ai_result = {
+            "detected": bool(entry.get("ai_detected")),
+            "score": float(entry.get("ai_score", 0.0)),
+            "reasons": entry.get("ai_reasons", []),
+            "techniques": entry.get("ai_techniques", []),
+            "provider": entry.get("ai_provider", "unknown"),
+            "model": entry.get("ai_model", "unknown"),
+            "mode": entry.get("ai_mode", "model"),
+        }
+    else:
+        ai_result = analyze_with_backend(
+            details,
+            event_id,
+            DEFAULT_CONFIG["ai_backend_url"],
+            int(DEFAULT_CONFIG["ai_backend_timeout_seconds"]),
+        )
+
+    entry["ai_detected"] = ai_result["detected"]
+    entry["ai_score"] = ai_result["score"]
+    entry["ai_reasons"] = ai_result["reasons"]
+    entry["ai_techniques"] = ai_result["techniques"]
+    entry["ai_provider"] = ai_result["provider"]
+    entry["ai_model"] = ai_result["model"]
+    entry["ai_mode"] = ai_result["mode"]
 
     # Manual side prefers external analyst/tool labels.
     label = labels.get(_event_key(entry), {})
@@ -110,10 +137,10 @@ def apply_detection_fields(entry, labels):
         entry["manual_notes"] = label.get("notes", "")
         entry["manual_techniques"] = label.get("techniques", [])
     else:
-        entry["manual_detected"] = comparison["manual"]["detected"]
+        entry["manual_detected"] = manual["detected"]
         entry["manual_source"] = "fallback-regex"
         entry["manual_notes"] = "No external analyst verdict yet"
-        entry["manual_techniques"] = comparison["manual"]["techniques"]
+        entry["manual_techniques"] = manual["techniques"]
 
     entry["agreement"] = entry["manual_detected"] == entry["ai_detected"]
     return entry
@@ -147,7 +174,7 @@ DASHBOARD_HTML = '''
 
     <h2>📊 Received Flags (Last 50)</h2>
     <table>
-        <tr><th>Timestamp</th><th>Source IP</th><th>Technique</th><th>Manual</th><th>Manual Source</th><th>AI</th><th>Details</th></tr>
+        <tr><th>Timestamp</th><th>Source IP</th><th>Technique</th><th>Manual</th><th>Manual Source</th><th>AI</th><th>AI Backend</th><th>Details</th></tr>
         {% for entry in logs %}
         <tr>
             <td class="timestamp">{{ entry.timestamp }}</td>
@@ -156,6 +183,7 @@ DASHBOARD_HTML = '''
             <td>{{ 'yes' if entry.manual_detected else 'no' }}</td>
             <td>{{ entry.manual_source }}</td>
             <td>{{ 'yes' if entry.ai_detected else 'no' }} ({{ entry.ai_score }})</td>
+            <td>{{ entry.ai_provider }}/{{ entry.ai_model }} ({{ entry.ai_mode }})</td>
             <td>{{ entry.details[:80] }}{% if entry.details|length > 80 %}...{% endif %}</td>
         </tr>
         {% endfor %}
@@ -206,6 +234,7 @@ DASHBOARD_HTML = '''
         <li><span class="endpoint">GET /dashboard</span> - This dashboard</li>
         <li><span class="endpoint">GET /api/flags</span> - JSON API</li>
         <li><span class="endpoint">POST /manual/label</span> - Attach external manual verdict (Volatility/IR)</li>
+        <li><span class="endpoint">AI Backend URL</span> - {{ ai_backend_url }}</li>
         <li><span class="endpoint">GET /status</span> - Health check</li>
     </ul>
 
@@ -254,6 +283,7 @@ def dashboard():
                                   detection_summary=detection_summary,
                                   payloads=payloads,
                                   sessions=active_sessions,
+                                  ai_backend_url=DEFAULT_CONFIG["ai_backend_url"],
                                   host_ip=DEFAULT_CONFIG["host_ip"],
                                   port=DEFAULT_CONFIG["c2_port"])
 
@@ -273,22 +303,38 @@ def collect():
     flag_data = request.get_data(as_text=True)
     timestamp = datetime.datetime.now().isoformat()
 
-    comparison = compare_detection(flag_data)
+    manual = manual_detect(flag_data)
 
     # Keep old behavior for manual extraction, with AI fallback for partial flags.
     technique = "Unknown"
-    if comparison["manual"]["techniques"]:
-        technique = comparison["manual"]["techniques"][0]
-    elif comparison["ai"]["techniques"]:
-        technique = comparison["ai"]["techniques"][0]
+    if manual["techniques"]:
+        technique = manual["techniques"][0]
+
+    event_id = str(uuid.uuid4())
+    ai_result = analyze_with_backend(
+        flag_data,
+        event_id,
+        DEFAULT_CONFIG["ai_backend_url"],
+        int(DEFAULT_CONFIG["ai_backend_timeout_seconds"]),
+    )
+
+    if technique == "Unknown" and ai_result.get("techniques"):
+        technique = ai_result["techniques"][0]
 
     # Log to JSON file
     log_entry = {
-        "event_id": str(uuid.uuid4()),
+        "event_id": event_id,
         "timestamp": timestamp,
         "source_ip": source_ip,
         "technique": technique,
         "details": flag_data[:200],
+        "ai_detected": ai_result["detected"],
+        "ai_score": ai_result["score"],
+        "ai_reasons": ai_result["reasons"],
+        "ai_techniques": ai_result["techniques"],
+        "ai_provider": ai_result["provider"],
+        "ai_model": ai_result["model"],
+        "ai_mode": ai_result["mode"],
     }
     log_file = Path(DEFAULT_CONFIG["log_dir"]) / "c2_log.json"
     with open(log_file, 'a') as f:
@@ -319,10 +365,13 @@ def collect():
         "status": "logged",
         "event_id": log_entry["event_id"],
         "technique": technique,
-        "manual_detected": comparison["manual"]["detected"],
-        "ai_detected": comparison["ai"]["detected"],
-        "ai_score": comparison["ai"]["score"],
-        "agreement": comparison["agreement"],
+        "manual_detected": manual["detected"],
+        "ai_detected": ai_result["detected"],
+        "ai_score": ai_result["score"],
+        "ai_provider": ai_result["provider"],
+        "ai_model": ai_result["model"],
+        "ai_mode": ai_result["mode"],
+        "agreement": manual["detected"] == ai_result["detected"],
     })
 
 
