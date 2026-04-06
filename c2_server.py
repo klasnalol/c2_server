@@ -10,8 +10,10 @@ import socket
 import subprocess
 import datetime
 import re
+import uuid
 from pathlib import Path
 from flask import Flask, request, send_file, jsonify, render_template_string
+from flag_detection import compare_detection, summarize_detection
 
 app = Flask(__name__)
 
@@ -65,6 +67,56 @@ for dir_name in [DEFAULT_CONFIG["payload_dir"], DEFAULT_CONFIG["log_dir"], DEFAU
 
 # In-memory session tracking
 active_sessions = {}
+MANUAL_LABELS_FILE = Path(DEFAULT_CONFIG["log_dir"]) / "manual_labels.json"
+
+
+def load_manual_labels():
+    if MANUAL_LABELS_FILE.exists():
+        try:
+            with open(MANUAL_LABELS_FILE, 'r') as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except:
+            pass
+    return {}
+
+
+def save_manual_labels(labels):
+    with open(MANUAL_LABELS_FILE, 'w') as f:
+        json.dump(labels, f, indent=2)
+
+
+def _event_key(entry):
+    if entry.get("event_id"):
+        return entry["event_id"]
+    return f"{entry.get('timestamp', '')}|{entry.get('source_ip', '')}"
+
+
+def apply_detection_fields(entry, labels):
+    entry = dict(entry)
+    comparison = compare_detection(entry.get("details", ""))
+
+    # AI side is always automated.
+    entry["ai_detected"] = comparison["ai"]["detected"]
+    entry["ai_score"] = comparison["ai"]["score"]
+    entry["ai_reasons"] = comparison["ai"]["reasons"]
+
+    # Manual side prefers external analyst/tool labels.
+    label = labels.get(_event_key(entry), {})
+    if "detected" in label:
+        entry["manual_detected"] = bool(label.get("detected"))
+        entry["manual_source"] = label.get("tool", "external")
+        entry["manual_notes"] = label.get("notes", "")
+        entry["manual_techniques"] = label.get("techniques", [])
+    else:
+        entry["manual_detected"] = comparison["manual"]["detected"]
+        entry["manual_source"] = "fallback-regex"
+        entry["manual_notes"] = "No external analyst verdict yet"
+        entry["manual_techniques"] = comparison["manual"]["techniques"]
+
+    entry["agreement"] = entry["manual_detected"] == entry["ai_detected"]
+    return entry
 
 # ------------------------------------------------------------
 # HTML Dashboard
@@ -95,13 +147,45 @@ DASHBOARD_HTML = '''
 
     <h2>📊 Received Flags (Last 50)</h2>
     <table>
-        <tr><th>Timestamp</th><th>Source IP</th><th>Technique</th><th>Details</th></tr>
+        <tr><th>Timestamp</th><th>Source IP</th><th>Technique</th><th>Manual</th><th>Manual Source</th><th>AI</th><th>Details</th></tr>
         {% for entry in logs %}
         <tr>
             <td class="timestamp">{{ entry.timestamp }}</td>
             <td>{{ entry.source_ip }}</td>
             <td class="flag">{{ entry.technique }}</td>
+            <td>{{ 'yes' if entry.manual_detected else 'no' }}</td>
+            <td>{{ entry.manual_source }}</td>
+            <td>{{ 'yes' if entry.ai_detected else 'no' }} ({{ entry.ai_score }})</td>
             <td>{{ entry.details[:80] }}{% if entry.details|length > 80 %}...{% endif %}</td>
+        </tr>
+        {% endfor %}
+    </table>
+
+    <h2>🤖 AI vs Manual Comparison</h2>
+    <table>
+        <tr><th>Total</th><th>Manual Hits</th><th>AI Hits</th><th>Agreement</th><th>Manual Only</th><th>AI Only</th><th>Neither</th></tr>
+        <tr>
+            <td>{{ detection_summary.total }}</td>
+            <td>{{ detection_summary.manual_detected }}</td>
+            <td>{{ detection_summary.ai_detected }}</td>
+            <td>{{ detection_summary.agreement }} ({{ detection_summary.agreement_rate }})</td>
+            <td>{{ detection_summary.manual_only }}</td>
+            <td>{{ detection_summary.ai_only }}</td>
+            <td>{{ detection_summary.neither }}</td>
+        </tr>
+    </table>
+
+    <h2>⚠ Disagreements (Latest 20)</h2>
+    <table>
+        <tr><th>Timestamp</th><th>Source IP</th><th>Manual</th><th>AI</th><th>AI Score</th><th>Excerpt</th></tr>
+        {% for row in detection_summary.disagreements %}
+        <tr>
+            <td class="timestamp">{{ row.timestamp }}</td>
+            <td>{{ row.source_ip }}</td>
+            <td>{{ 'yes' if row.manual_detected else 'no' }}</td>
+            <td>{{ 'yes' if row.ai_detected else 'no' }}</td>
+            <td>{{ row.ai_score }}</td>
+            <td>{{ row.excerpt }}</td>
         </tr>
         {% endfor %}
     </table>
@@ -121,6 +205,7 @@ DASHBOARD_HTML = '''
         <li><span class="endpoint">GET /get/&lt;filename&gt;</span> - Download Windows payloads</li>
         <li><span class="endpoint">GET /dashboard</span> - This dashboard</li>
         <li><span class="endpoint">GET /api/flags</span> - JSON API</li>
+        <li><span class="endpoint">POST /manual/label</span> - Attach external manual verdict (Volatility/IR)</li>
         <li><span class="endpoint">GET /status</span> - Health check</li>
     </ul>
 
@@ -149,20 +234,24 @@ DASHBOARD_HTML = '''
 def dashboard():
     # Read last 50 log entries
     logs = []
+    labels = load_manual_labels()
     log_file = Path(DEFAULT_CONFIG["log_dir"]) / "c2_log.json"
     if log_file.exists():
         with open(log_file, 'r') as f:
             for line in f:
                 try:
-                    logs.append(json.loads(line))
+                    entry = json.loads(line)
+                    logs.append(apply_detection_fields(entry, labels))
                 except:
                     pass
     logs = logs[-50:]
+    detection_summary = summarize_detection(logs)
 
     payloads = [f.name for f in Path(DEFAULT_CONFIG["payload_dir"]).iterdir() if f.is_file()]
 
     return render_template_string(DASHBOARD_HTML,
                                   logs=logs,
+                                  detection_summary=detection_summary,
                                   payloads=payloads,
                                   sessions=active_sessions,
                                   host_ip=DEFAULT_CONFIG["host_ip"],
@@ -184,18 +273,22 @@ def collect():
     flag_data = request.get_data(as_text=True)
     timestamp = datetime.datetime.now().isoformat()
 
-    # Extract MITRE technique ID from flag (e.g., FLAG{T1059.001-...})
+    comparison = compare_detection(flag_data)
+
+    # Keep old behavior for manual extraction, with AI fallback for partial flags.
     technique = "Unknown"
-    match = re.search(r'FLAG\{([^}-]+)', flag_data)
-    if match:
-        technique = match.group(1)
+    if comparison["manual"]["techniques"]:
+        technique = comparison["manual"]["techniques"][0]
+    elif comparison["ai"]["techniques"]:
+        technique = comparison["ai"]["techniques"][0]
 
     # Log to JSON file
     log_entry = {
+        "event_id": str(uuid.uuid4()),
         "timestamp": timestamp,
         "source_ip": source_ip,
         "technique": technique,
-        "details": flag_data[:200]
+        "details": flag_data[:200],
     }
     log_file = Path(DEFAULT_CONFIG["log_dir"]) / "c2_log.json"
     with open(log_file, 'a') as f:
@@ -222,7 +315,48 @@ def collect():
     print(f"\033[92m[+] {timestamp} | {source_ip} | {technique}\033[0m")
     print(f"    {flag_data[:100]}")
 
-    return jsonify({"status": "logged", "technique": technique})
+    return jsonify({
+        "status": "logged",
+        "event_id": log_entry["event_id"],
+        "technique": technique,
+        "manual_detected": comparison["manual"]["detected"],
+        "ai_detected": comparison["ai"]["detected"],
+        "ai_score": comparison["ai"]["score"],
+        "agreement": comparison["agreement"],
+    })
+
+
+@app.route('/manual/label', methods=['POST'])
+def manual_label():
+    payload = request.get_json(silent=True) or {}
+    event_id = payload.get("event_id")
+    timestamp = payload.get("timestamp")
+    source_ip = payload.get("source_ip")
+    detected = payload.get("detected")
+    tool = payload.get("tool", "external")
+    techniques = payload.get("techniques", [])
+    notes = payload.get("notes", "")
+
+    if detected is None:
+        return jsonify({"error": "'detected' is required"}), 400
+
+    if event_id:
+        key = event_id
+    elif timestamp and source_ip:
+        key = f"{timestamp}|{source_ip}"
+    else:
+        return jsonify({"error": "Provide either event_id or (timestamp and source_ip)"}), 400
+
+    labels = load_manual_labels()
+    labels[key] = {
+        "detected": bool(detected),
+        "tool": tool,
+        "techniques": techniques,
+        "notes": notes,
+        "labeled_at": datetime.datetime.now().isoformat(),
+    }
+    save_manual_labels(labels)
+    return jsonify({"status": "saved", "key": key})
 
 @app.route('/get/<filename>')
 def get_payload(filename):
@@ -245,15 +379,20 @@ def get_payload(filename):
 @app.route('/api/flags')
 def api_flags():
     flags = []
+    labels = load_manual_labels()
     log_file = Path(DEFAULT_CONFIG["log_dir"]) / "c2_log.json"
     if log_file.exists():
         with open(log_file, 'r') as f:
             for line in f:
                 try:
-                    flags.append(json.loads(line))
+                    entry = json.loads(line)
+                    flags.append(apply_detection_fields(entry, labels))
                 except:
                     pass
-    return jsonify(flags)
+    return jsonify({
+        "flags": flags,
+        "summary": summarize_detection(flags),
+    })
 
 @app.route('/clear', methods=['POST'])
 def clear_logs():
