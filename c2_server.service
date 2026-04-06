@@ -1,0 +1,16 @@
+[Unit]
+Description=MITRE ATT&CK C2 Server for VM Detection Testing
+After=network.target
+
+[Service]
+Type=simple
+User=klasnalol
+WorkingDirectory=/home/klasnalol/c2_server
+ExecStart=/usr/bin/python3 /home/klasnalol/c2_server/c2_server.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

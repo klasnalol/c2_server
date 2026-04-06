@@ -1,0 +1,4 @@
+{"timestamp": "2026-04-06T07:32:15.364010", "source_ip": "192.168.122.46", "technique": "T1059.001", "details": "FLAG{T1059.001-powershell-execution}"}
+{"timestamp": "2026-04-06T07:32:19.213904", "source_ip": "192.168.122.46", "technique": "T1083", "details": "FLAG{T1083-file-discovery}\nFound files: GitHub, Visual Studio 18, WindowsPowerShell"}
+{"timestamp": "2026-04-06T07:32:19.378127", "source_ip": "192.168.122.46", "technique": "T1105", "details": "FLAG{T1105-ingress-tool-transfer}"}
+{"timestamp": "2026-04-06T07:32:23.726312", "source_ip": "192.168.122.46", "technique": "T1041", "details": "FLAG{T1041-exfiltration-over-c2}\n{\"UserName\":\"test\",\"ComputerName\":\"DESKTOP-UBOCMB0\",\"OS\":\"Microsoft Windows 10 Pro\"}"}

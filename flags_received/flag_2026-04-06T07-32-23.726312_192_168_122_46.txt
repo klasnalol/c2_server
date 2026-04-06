@@ -1,0 +1,5 @@
+Timestamp: 2026-04-06T07:32:23.726312
+Source IP: 192.168.122.46
+Technique: T1041
+Data: FLAG{T1041-exfiltration-over-c2}
+{"UserName":"test","ComputerName":"DESKTOP-UBOCMB0","OS":"Microsoft Windows 10 Pro"}
