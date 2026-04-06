@@ -11,6 +11,7 @@ import subprocess
 import datetime
 import re
 import uuid
+from urllib.parse import urlparse
 from pathlib import Path
 from flask import Flask, request, send_file, jsonify, render_template_string
 from ai_backend_client import analyze_with_backend
@@ -29,6 +30,7 @@ DEFAULT_CONFIG = {
     "flags_dir": "flags_received",
     "ai_backend_url": "http://127.0.0.1:8090/analyze",
     "ai_backend_timeout_seconds": 8,
+    "ai_analysis_enabled": True,
     "host_ip": None          # Will auto-detect
 }
 
@@ -90,6 +92,58 @@ def save_manual_labels(labels):
         json.dump(labels, f, indent=2)
 
 
+def save_runtime_config():
+    persisted = {}
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                existing = json.load(f)
+                if isinstance(existing, dict):
+                    persisted.update(existing)
+        except:
+            pass
+
+    for key in [
+        "c2_port",
+        "host_ip",
+        "ai_backend_url",
+        "ai_backend_timeout_seconds",
+        "ai_analysis_enabled",
+    ]:
+        persisted[key] = DEFAULT_CONFIG.get(key)
+
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(persisted, f, indent=4)
+
+
+def parse_backend_target(url_value):
+    parsed = urlparse(url_value or "")
+    return {
+        "ip": parsed.hostname or "127.0.0.1",
+        "port": parsed.port or 8090,
+    }
+
+
+def get_ai_result(text, event_id):
+    if not DEFAULT_CONFIG.get("ai_analysis_enabled", True):
+        return {
+            "detected": False,
+            "score": 0.0,
+            "reasons": ["ai analysis disabled"],
+            "techniques": [],
+            "provider": "disabled",
+            "model": "disabled",
+            "mode": "disabled",
+        }
+
+    return analyze_with_backend(
+        text,
+        event_id,
+        DEFAULT_CONFIG["ai_backend_url"],
+        int(DEFAULT_CONFIG["ai_backend_timeout_seconds"]),
+    )
+
+
 def _event_key(entry):
     if entry.get("event_id"):
         return entry["event_id"]
@@ -114,12 +168,7 @@ def apply_detection_fields(entry, labels):
             "mode": entry.get("ai_mode", "model"),
         }
     else:
-        ai_result = analyze_with_backend(
-            details,
-            event_id,
-            DEFAULT_CONFIG["ai_backend_url"],
-            int(DEFAULT_CONFIG["ai_backend_timeout_seconds"]),
-        )
+        ai_result = get_ai_result(details, event_id)
 
     entry["ai_detected"] = ai_result["detected"]
     entry["ai_score"] = ai_result["score"]
@@ -165,12 +214,34 @@ DASHBOARD_HTML = '''
         .endpoint { color: #9cdcfe; }
         .payload-list a { color: #4ec9b0; text-decoration: none; }
         .payload-list a:hover { text-decoration: underline; }
+        .settings-card { border: 1px solid #3e3e3e; padding: 12px; margin-top: 20px; background: #252525; }
+        .settings-grid { display: grid; grid-template-columns: repeat(4, minmax(140px, 1fr)); gap: 8px; }
+        .settings-grid input { background: #1d1d1d; color: #d4d4d4; border: 1px solid #4a4a4a; padding: 6px; }
+        .settings-grid button { background: #007f6b; color: #fff; border: 0; padding: 8px; cursor: pointer; }
+        .settings-grid button.stop { background: #8a3b3b; }
+        .settings-grid button.test { background: #385e8a; }
+        #ai-settings-status { margin-top: 8px; color: #dcdcaa; min-height: 20px; }
     </style>
 </head>
 <body>
 <div class="container">
     <h1>🎯 MITRE ATT&CK C2 Server</h1>
     <p>Host IP: <strong>{{ host_ip }}:{{ port }}</strong> | VM Bridge Network</p>
+
+    <div class="settings-card">
+        <h2>⚙ AI Backend Settings</h2>
+        <div class="settings-grid">
+            <input id="ai-backend-ip" placeholder="AI Backend IP" value="{{ ai_backend_ip }}" />
+            <input id="ai-backend-port" placeholder="Port" value="{{ ai_backend_port }}" />
+            <input id="ai-timeout" placeholder="Timeout (s)" value="{{ ai_backend_timeout_seconds }}" />
+            <button onclick="saveAiSettings()">Save IP/Port</button>
+            <button onclick="startAiAnalysis()">Start AI Analysis</button>
+            <button class="stop" onclick="stopAiAnalysis()">Stop AI Analysis</button>
+            <button class="test" onclick="testAiBackend()">Test Backend</button>
+            <div>Current: {{ 'enabled' if ai_analysis_enabled else 'disabled' }}</div>
+        </div>
+        <div id="ai-settings-status"></div>
+    </div>
 
     <h2>📊 Received Flags (Last 50)</h2>
     <table>
@@ -251,6 +322,45 @@ DASHBOARD_HTML = '''
         {% endfor %}
     </table>
 </div>
+<script>
+async function postJson(url, body) {
+    const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body || {})
+    });
+    return response.json();
+}
+
+function setStatus(message) {
+    document.getElementById('ai-settings-status').textContent = message;
+}
+
+async function saveAiSettings() {
+    const ip = document.getElementById('ai-backend-ip').value.trim();
+    const port = document.getElementById('ai-backend-port').value.trim();
+    const timeout = document.getElementById('ai-timeout').value.trim();
+    const result = await postJson('/api/settings/ai', { ip, port, timeout });
+    setStatus(result.message || JSON.stringify(result));
+}
+
+async function startAiAnalysis() {
+    const result = await postJson('/api/settings/ai/start', {});
+    setStatus(result.message || JSON.stringify(result));
+}
+
+async function stopAiAnalysis() {
+    const result = await postJson('/api/settings/ai/stop', {});
+    setStatus(result.message || JSON.stringify(result));
+}
+
+async function testAiBackend() {
+    const result = await postJson('/api/settings/ai/test', {
+        text: 'FLAG{T1059.001-powershell-execution}'
+    });
+    setStatus(result.message || JSON.stringify(result));
+}
+</script>
 </body>
 </html>
 '''
@@ -277,6 +387,7 @@ def dashboard():
     detection_summary = summarize_detection(logs)
 
     payloads = [f.name for f in Path(DEFAULT_CONFIG["payload_dir"]).iterdir() if f.is_file()]
+    backend = parse_backend_target(DEFAULT_CONFIG["ai_backend_url"])
 
     return render_template_string(DASHBOARD_HTML,
                                   logs=logs,
@@ -284,6 +395,10 @@ def dashboard():
                                   payloads=payloads,
                                   sessions=active_sessions,
                                   ai_backend_url=DEFAULT_CONFIG["ai_backend_url"],
+                                  ai_backend_ip=backend["ip"],
+                                  ai_backend_port=backend["port"],
+                                  ai_backend_timeout_seconds=DEFAULT_CONFIG["ai_backend_timeout_seconds"],
+                                  ai_analysis_enabled=DEFAULT_CONFIG.get("ai_analysis_enabled", True),
                                   host_ip=DEFAULT_CONFIG["host_ip"],
                                   port=DEFAULT_CONFIG["c2_port"])
 
@@ -311,12 +426,7 @@ def collect():
         technique = manual["techniques"][0]
 
     event_id = str(uuid.uuid4())
-    ai_result = analyze_with_backend(
-        flag_data,
-        event_id,
-        DEFAULT_CONFIG["ai_backend_url"],
-        int(DEFAULT_CONFIG["ai_backend_timeout_seconds"]),
-    )
+    ai_result = get_ai_result(flag_data, event_id)
 
     if technique == "Unknown" and ai_result.get("techniques"):
         technique = ai_result["techniques"][0]
@@ -372,6 +482,74 @@ def collect():
         "ai_model": ai_result["model"],
         "ai_mode": ai_result["mode"],
         "agreement": manual["detected"] == ai_result["detected"],
+    })
+
+
+@app.route('/api/settings/ai', methods=['POST'])
+def api_settings_ai():
+    payload = request.get_json(silent=True) or {}
+    ip = str(payload.get("ip", "")).strip()
+    port = str(payload.get("port", "8090")).strip()
+    timeout = str(payload.get("timeout", DEFAULT_CONFIG["ai_backend_timeout_seconds"]))
+
+    if not re.match(r'^\d+\.\d+\.\d+\.\d+$', ip):
+        return jsonify({"status": "error", "message": "Invalid IP format"}), 400
+
+    if not port.isdigit():
+        return jsonify({"status": "error", "message": "Port must be numeric"}), 400
+
+    timeout_int = int(timeout)
+    if timeout_int < 1 or timeout_int > 120:
+        return jsonify({"status": "error", "message": "Timeout must be between 1 and 120 seconds"}), 400
+
+    DEFAULT_CONFIG["ai_backend_url"] = f"http://{ip}:{int(port)}/analyze"
+    DEFAULT_CONFIG["ai_backend_timeout_seconds"] = timeout_int
+    save_runtime_config()
+
+    return jsonify({
+        "status": "ok",
+        "ai_backend_url": DEFAULT_CONFIG["ai_backend_url"],
+        "message": f"Saved AI backend to {DEFAULT_CONFIG['ai_backend_url']}"
+    })
+
+
+@app.route('/api/settings/ai/start', methods=['POST'])
+def api_settings_ai_start():
+    DEFAULT_CONFIG["ai_analysis_enabled"] = True
+    save_runtime_config()
+    return jsonify({
+        "status": "ok",
+        "message": "AI analysis enabled"
+    })
+
+
+@app.route('/api/settings/ai/stop', methods=['POST'])
+def api_settings_ai_stop():
+    DEFAULT_CONFIG["ai_analysis_enabled"] = False
+    save_runtime_config()
+    return jsonify({
+        "status": "ok",
+        "message": "AI analysis disabled"
+    })
+
+
+@app.route('/api/settings/ai/test', methods=['POST'])
+def api_settings_ai_test():
+    payload = request.get_json(silent=True) or {}
+    sample_text = payload.get("text", "FLAG{T1059.001-powershell-execution}")
+    test_result = analyze_with_backend(
+        sample_text,
+        "dashboard-test",
+        DEFAULT_CONFIG["ai_backend_url"],
+        int(DEFAULT_CONFIG["ai_backend_timeout_seconds"]),
+    )
+    return jsonify({
+        "status": "ok",
+        "message": (
+            f"Test result: detected={test_result['detected']} "
+            f"score={test_result['score']} mode={test_result['mode']}"
+        ),
+        "result": test_result,
     })
 
 

@@ -2,5 +2,6 @@
     "c2_port": 8080,
     "host_ip": "192.168.8.90",
     "ai_backend_url": "http://192.168.8.53:8090/analyze",
-    "ai_backend_timeout_seconds": 12
+    "ai_backend_timeout_seconds": 12,
+    "ai_analysis_enabled": true
 }

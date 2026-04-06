@@ -10,3 +10,5 @@ AI backend listening on 0.0.0.0:8090 provider=ollama model=llama3.1:8b
 127.0.0.1 - - [06/Apr/2026 10:03:31] "GET /status HTTP/1.1" 200 -
 127.0.0.1 - - [06/Apr/2026 10:03:40] "POST /analyze HTTP/1.1" 200 -
 127.0.0.1 - - [06/Apr/2026 10:03:43] "POST /analyze HTTP/1.1" 200 -
+192.168.8.53 - - [06/Apr/2026 10:10:55] "POST /analyze HTTP/1.1" 200 -
+192.168.8.53 - - [06/Apr/2026 10:11:01] "POST /analyze HTTP/1.1" 200 -
