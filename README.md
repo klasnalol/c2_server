@@ -80,6 +80,11 @@ In `c2_config.json`, you can set:
 }
 ```
 
+Relative values for `payload_dir`, `log_dir`, and `flags_dir` are resolved from
+the repository directory, not from the shell working directory. This keeps
+payload serving and evidence logging stable when the server is started through
+systemd, `manage.sh`, or a manual Python command.
+
 ## 4. Manual Ground Truth (Volatility / IR)
 
 Manual verdicts can be attached via:

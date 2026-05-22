@@ -18,11 +18,12 @@ from ai_backend_client import analyze_with_backend
 from flag_detection import manual_detect, summarize_detection
 
 app = Flask(__name__)
+BASE_DIR = Path(__file__).resolve().parent
 
 # ------------------------------------------------------------
 # Configuration (auto-detect IP, or use config file)
 # ------------------------------------------------------------
-CONFIG_FILE = Path(__file__).parent / "c2_config.json"
+CONFIG_FILE = BASE_DIR / "c2_config.json"
 DEFAULT_CONFIG = {
     "c2_port": 8080,
     "payload_dir": "payloads",
@@ -66,13 +67,25 @@ if CONFIG_FILE.exists():
 if not DEFAULT_CONFIG["host_ip"]:
     DEFAULT_CONFIG["host_ip"] = get_best_local_ip()
 
-# Ensure directories exist
-for dir_name in [DEFAULT_CONFIG["payload_dir"], DEFAULT_CONFIG["log_dir"], DEFAULT_CONFIG["flags_dir"]]:
-    Path(dir_name).mkdir(parents=True, exist_ok=True)
+def configured_path(config_key):
+    path = Path(DEFAULT_CONFIG[config_key])
+    if path.is_absolute():
+        return path
+    return BASE_DIR / path
+
+
+PAYLOAD_DIR = configured_path("payload_dir")
+LOG_DIR = configured_path("log_dir")
+FLAGS_DIR = configured_path("flags_dir")
+
+# Ensure directories exist. Relative config paths are repository-relative so
+# service behavior does not depend on the shell working directory.
+for directory in [PAYLOAD_DIR, LOG_DIR, FLAGS_DIR]:
+    directory.mkdir(parents=True, exist_ok=True)
 
 # In-memory session tracking
 active_sessions = {}
-MANUAL_LABELS_FILE = Path(DEFAULT_CONFIG["log_dir"]) / "manual_labels.json"
+MANUAL_LABELS_FILE = LOG_DIR / "manual_labels.json"
 
 
 def load_manual_labels():
@@ -374,7 +387,7 @@ def dashboard():
     # Read last 50 log entries
     logs = []
     labels = load_manual_labels()
-    log_file = Path(DEFAULT_CONFIG["log_dir"]) / "c2_log.json"
+    log_file = LOG_DIR / "c2_log.json"
     if log_file.exists():
         with open(log_file, 'r') as f:
             for line in f:
@@ -386,7 +399,7 @@ def dashboard():
     logs = logs[-50:]
     detection_summary = summarize_detection(logs)
 
-    payloads = [f.name for f in Path(DEFAULT_CONFIG["payload_dir"]).iterdir() if f.is_file()]
+    payloads = [f.name for f in PAYLOAD_DIR.iterdir() if f.is_file()]
     backend = parse_backend_target(DEFAULT_CONFIG["ai_backend_url"])
 
     return render_template_string(DASHBOARD_HTML,
@@ -408,7 +421,7 @@ def status():
         "status": "online",
         "host_ip": DEFAULT_CONFIG["host_ip"],
         "port": DEFAULT_CONFIG["c2_port"],
-        "payloads_available": len(list(Path(DEFAULT_CONFIG["payload_dir"]).iterdir())),
+        "payloads_available": len([p for p in PAYLOAD_DIR.iterdir() if p.is_file()]),
         "active_sessions": len(active_sessions)
     })
 
@@ -446,12 +459,12 @@ def collect():
         "ai_model": ai_result["model"],
         "ai_mode": ai_result["mode"],
     }
-    log_file = Path(DEFAULT_CONFIG["log_dir"]) / "c2_log.json"
+    log_file = LOG_DIR / "c2_log.json"
     with open(log_file, 'a') as f:
         f.write(json.dumps(log_entry) + '\n')
 
     # Save raw flag to separate file
-    flag_file = Path(DEFAULT_CONFIG["flags_dir"]) / f"flag_{timestamp.replace(':', '-')}_{source_ip.replace('.', '_')}.txt"
+    flag_file = FLAGS_DIR / f"flag_{timestamp.replace(':', '-')}_{source_ip.replace('.', '_')}.txt"
     with open(flag_file, 'w') as f:
         f.write(f"Timestamp: {timestamp}\nSource IP: {source_ip}\nTechnique: {technique}\nData: {flag_data}\n")
 
@@ -591,12 +604,12 @@ def get_payload(filename):
     if '..' in filename or filename.startswith('/'):
         return "Invalid filename", 400
 
-    filepath = Path(DEFAULT_CONFIG["payload_dir"]) / filename
+    filepath = PAYLOAD_DIR / filename
     if filepath.exists() and filepath.is_file():
         # Log download
         timestamp = datetime.datetime.now().isoformat()
         print(f"\033[94m[↓] {timestamp} | {request.remote_addr} downloaded {filename}\033[0m")
-        download_log = Path(DEFAULT_CONFIG["log_dir"]) / "downloads.log"
+        download_log = LOG_DIR / "downloads.log"
         with open(download_log, 'a') as f:
             f.write(f"{timestamp} | {request.remote_addr} | {filename}\n")
         return send_file(filepath, as_attachment=True)
@@ -607,7 +620,7 @@ def get_payload(filename):
 def api_flags():
     flags = []
     labels = load_manual_labels()
-    log_file = Path(DEFAULT_CONFIG["log_dir"]) / "c2_log.json"
+    log_file = LOG_DIR / "c2_log.json"
     if log_file.exists():
         with open(log_file, 'r') as f:
             for line in f:
@@ -623,9 +636,10 @@ def api_flags():
 
 @app.route('/clear', methods=['POST'])
 def clear_logs():
-    for d in [DEFAULT_CONFIG["log_dir"], DEFAULT_CONFIG["flags_dir"]]:
-        for f in Path(d).iterdir():
-            f.unlink()
+    for directory in [LOG_DIR, FLAGS_DIR]:
+        for path in directory.iterdir():
+            if path.is_file():
+                path.unlink()
     active_sessions.clear()
     return jsonify({"status": "cleared"})
 
@@ -640,7 +654,7 @@ if __name__ == '__main__':
     ║  Host IP: {DEFAULT_CONFIG['host_ip']:<44} ║
     ║  Port: {DEFAULT_CONFIG['c2_port']:<44} ║
     ║  Dashboard: http://{DEFAULT_CONFIG['host_ip']}:{DEFAULT_CONFIG['c2_port']}/dashboard ║
-    ║  Payload Dir: {DEFAULT_CONFIG['payload_dir']:<44} ║
+    ║  Payload Dir: {str(PAYLOAD_DIR):<44} ║
     ╚═══════════════════════════════════════════════════════════╝
     """)
     app.run(host='0.0.0.0', port=DEFAULT_CONFIG['c2_port'], debug=False, threaded=True)

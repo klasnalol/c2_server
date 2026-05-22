@@ -6,6 +6,8 @@ from pathlib import Path
 
 from flag_detection import compare_detection, summarize_detection
 
+BASE_DIR = Path(__file__).resolve().parent
+
 
 def load_entries(log_file: Path) -> list[dict]:
     entries = []
@@ -25,7 +27,7 @@ def load_entries(log_file: Path) -> list[dict]:
 
 
 def main() -> int:
-    log_file = Path("logs") / "c2_log.json"
+    log_file = BASE_DIR / "logs" / "c2_log.json"
     entries = load_entries(log_file)
 
     if not entries:

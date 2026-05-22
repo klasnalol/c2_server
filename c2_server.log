@@ -21,3 +21,4 @@
 127.0.0.1 - - [06/Apr/2026 10:10:55] "GET /status HTTP/1.1" 200 -
 127.0.0.1 - - [06/Apr/2026 10:10:55] "POST /api/settings/ai/test HTTP/1.1" 200 -
 127.0.0.1 - - [06/Apr/2026 10:11:01] "POST /api/settings/ai/test HTTP/1.1" 200 -
+127.0.0.1 - - [06/Apr/2026 10:13:54] "GET /status HTTP/1.1" 200 -
