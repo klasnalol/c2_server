@@ -1,5 +1,0 @@
-Timestamp: 2026-04-06T07:32:19.213904
-Source IP: 192.168.122.46
-Technique: T1083
-Data: FLAG{T1083-file-discovery}
-Found files: GitHub, Visual Studio 18, WindowsPowerShell

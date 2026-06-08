@@ -7,6 +7,24 @@ This repository now runs with two independent apps:
 
 The C2 server calls the AI backend at `ai_backend_url` from `c2_config.json`.
 
+## Quick Start: Dump → Analyze
+
+If the Windows VM is already running and the C2 server is up, the fastest path is:
+
+```bash
+cd lab
+./dump_and_report.sh R1-D1-active.raw
+```
+
+This dumps VM memory and prints the exact command to analyze. Then open the
+dashboard at `http://<host_ip>:8080/dashboard`, click the dump name under
+**Available dumps** to auto-fill the path, and click **🔬 Start Async Analyze**.
+
+- For full VM creation and network setup, see [`lab/LAB_SETUP.md`](lab/LAB_SETUP.md).
+- For all management commands, run `bash manage.sh` or `bash manage.sh help`.
+- For multi-snapshot methodology (baseline → active → persist → idle), see
+  the *Multi-Snapshot Strategy* section in [`lab/LAB_SETUP.md`](lab/LAB_SETUP.md).
+
 ## 1. Start Services
 
 Start AI backend first:
@@ -168,3 +186,15 @@ small HTTP call to the AI backend.
 - Restrict `8090` to C2 source IPs with firewall rules.
 - Place backend behind reverse proxy with API key if used outside trusted LAN.
 - Keep `request_timeout_seconds` low to avoid blocking C2 ingestion.
+
+## Documentation Index
+
+| Document | What it covers |
+|----------|---------------|
+| [`lab/LAB_SETUP.md`](lab/LAB_SETUP.md) | VM creation, Windows 10 install, network setup, memory acquisition scripts, multi-snapshot methodology |
+| [`lab/dump_and_report.sh`](lab/dump_and_report.sh) | Streamlined `virsh dump` + auto-print analysis commands |
+| [`lab/dump_memory.sh`](lab/dump_memory.sh) | Low-level memory acquisition (`pmemsave` / `virsh dump` fallback) |
+| [`lab/vm_create.sh`](lab/vm_create.sh) | Automated Windows 10 VM creation via `virt-install` |
+| [`manage.sh`](manage.sh) | Start/stop C2 and AI backend, CLI forensic analysis, import labels |
+| [`forensic_config.json`](forensic_config.json) | Volatility3 path, YARA rules directory, output settings |
+| [`c2_config.json`](c2_config.json) | C2 port, payload directory, AI backend URL and timeout |

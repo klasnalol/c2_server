@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+logs/
+ai_backend.log
+c2_server.log
+
+# Runtime data / evidence
+flags_received/
+downloads.log
+
+# Forensic outputs (generated)
+forensic_output/
+
+# Memory dumps (large binary files)
+lab/dumps/*.raw
+lab/dumps/*.dmp
+lab/dumps/*.vmem
+lab/isos/*.iso
+lab/isos/*.img
+lab/vm_images/*.qcow2
+lab/vm_images/*.qcow2c
+lab/vm_images/*.vmdk
+
+# Labels (generated at runtime)
+logs/forensic_labels.json
+logs/manual_labels.json
+
+# OS
+.DS_Store
+Thumbs.db

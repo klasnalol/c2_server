@@ -1,0 +1,12 @@
+{
+  "volatility_bin": ".venv/bin/vol",
+  "yara_rules_dir": "yara_rules",
+  "strings_min_length": 8,
+  "output_dir": "forensic_output",
+  "ai_backend_url": "http://127.0.0.1:8090/analyze",
+  "ai_backend_timeout_seconds": 15,
+  "c2_log_file": "logs/c2_log.json",
+  "correlation_window_seconds": 300,
+  "c2_ip_hint": "192.168.122.1",
+  "c2_port_hint": 8080
+}

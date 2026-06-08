@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Flag detection helpers for manual and AI-assisted comparison."""
+"""Flag detection helpers for manual and AI-assisted comparison.
+
+Extended with forensic artifact detection for memory dump analysis.
+"""
 
 import math
 import re
@@ -21,6 +24,33 @@ CONTEXT_KEYWORDS = {
     "attack",
     "tactic",
     "technique",
+}
+
+# Forensic artifact patterns for memory-derived strings
+C2_URL_PATTERN = re.compile(r"192\.168\.\d+\.\d+:\d+", re.IGNORECASE)
+DOWNLOAD_CRADLE_PATTERN = re.compile(
+    r"(Invoke-WebRequest|IEX\s*\(|DownloadString|New-Object\s+Net\.WebClient)",
+    re.IGNORECASE,
+)
+BASE64_DECODE_PATTERN = re.compile(
+    r"(System\.Convert::FromBase64String|FromBase64String)",
+    re.IGNORECASE,
+)
+REGISTRY_RUN_PATTERN = re.compile(
+    r"(CurrentVersion\\Run|HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run)",
+    re.IGNORECASE,
+)
+WMI_PERSISTENCE_PATTERN = re.compile(
+    r"(__EventFilter|CommandLineEventConsumer|__FilterToConsumerBinding|WmiPrvSE\.exe)",
+    re.IGNORECASE,
+)
+POWERSHELL_BYPASS_PATTERN = re.compile(
+    r"powershell\.exe.*-ExecutionPolicy\s+Bypass",
+    re.IGNORECASE,
+)
+SUSPICIOUS_PROCESS_NAMES = {
+    "powershell.exe", "cmd.exe", "wscript.exe",
+    "cscript.exe", "mshta.exe", "WmiPrvSE.exe",
 }
 
 
@@ -173,3 +203,174 @@ def summarize_detection(log_entries: list[dict]) -> dict:
         summary["agreement_rate"] = 0.0
 
     return summary
+
+
+def forensic_detect_strings(strings_list: list[str]) -> dict:
+    """Score a list of memory-extracted strings for forensic relevance.
+
+    Returns a structured result similar to ai_assisted_detect so it can
+    be fed into the same comparison pipeline.
+    """
+    text = "\n".join(strings_list) if strings_list else ""
+    reasons = []
+    score = 0.0
+    flags = []
+    techniques = []
+
+    # Exact flag markers
+    for s in strings_list:
+        flags.extend([m.group(0) for m in FLAG_PATTERN.finditer(s)])
+        techniques.extend(_extract_techniques(s))
+
+    if flags:
+        score += 0.65
+        reasons.append("strict FLAG{...} match in memory strings")
+
+    # C2 URL references
+    c2_urls = []
+    for s in strings_list:
+        c2_urls.extend(C2_URL_PATTERN.findall(s))
+    if c2_urls:
+        score += 0.30
+        reasons.append("C2 URL in memory strings")
+
+    # Download cradle indicators
+    cradle_hits = []
+    for s in strings_list:
+        cradle_hits.extend(DOWNLOAD_CRADLE_PATTERN.findall(s))
+    if cradle_hits:
+        score += 0.25
+        reasons.append("PowerShell download cradle in memory")
+
+    # Base64 decode at runtime
+    base64_hits = []
+    for s in strings_list:
+        base64_hits.extend(BASE64_DECODE_PATTERN.findall(s))
+    if base64_hits:
+        score += 0.20
+        reasons.append("Base64 decode routine in memory")
+
+    # Registry persistence
+    reg_hits = []
+    for s in strings_list:
+        reg_hits.extend(REGISTRY_RUN_PATTERN.findall(s))
+    if reg_hits:
+        score += 0.20
+        reasons.append("registry Run key persistence in memory")
+
+    # WMI persistence
+    wmi_hits = []
+    for s in strings_list:
+        wmi_hits.extend(WMI_PERSISTENCE_PATTERN.findall(s))
+    if wmi_hits:
+        score += 0.20
+        reasons.append("WMI persistence artifact in memory")
+
+    # PowerShell bypass
+    bypass_hits = []
+    for s in strings_list:
+        bypass_hits.extend(POWERSHELL_BYPASS_PATTERN.findall(s))
+    if bypass_hits:
+        score += 0.25
+        reasons.append("PowerShell execution-policy bypass in memory")
+
+    # Context keywords
+    lowered = text.lower()
+    keyword_hits = [word for word in CONTEXT_KEYWORDS if word in lowered]
+    if keyword_hits:
+        score += min(0.24, 0.08 * len(keyword_hits))
+        reasons.append(f"context keywords ({', '.join(sorted(keyword_hits[:3]))})")
+
+    score = min(1.0, round(score, 3))
+    detected = score >= 0.45
+
+    techniques = list(dict.fromkeys(techniques))
+    if not flags and detected and techniques:
+        flags = [f"FLAG{{{techniques[0]}-inferred}}"]
+
+    if not reasons:
+        reasons.append("no strong forensic indicators")
+
+    return {
+        "detected": detected,
+        "score": score,
+        "reasons": reasons,
+        "flags": flags,
+        "techniques": techniques,
+        "c2_urls": list(set(c2_urls)) if c2_urls else [],
+        "cradle_hits": list(set(cradle_hits)) if cradle_hits else [],
+        "base64_hits": list(set(base64_hits)) if base64_hits else [],
+        "registry_hits": list(set(reg_hits)) if reg_hits else [],
+        "wmi_hits": list(set(wmi_hits)) if wmi_hits else [],
+        "bypass_hits": list(set(bypass_hits)) if bypass_hits else [],
+    }
+
+
+def forensic_detect_process(process_entry: dict) -> dict:
+    """Score a single process record for suspiciousness.
+
+    process_entry should contain keys like:
+        name, pid, ppid, cmdline, CreateTime, etc.
+    """
+    name = (process_entry.get("name") or process_entry.get("ImageFileName") or "").lower()
+    cmdline = (process_entry.get("cmdline") or process_entry.get("Args") or "")
+    score = 0.0
+    reasons = []
+
+    if name in {n.lower() for n in SUSPICIOUS_PROCESS_NAMES}:
+        score += 0.25
+        reasons.append(f"suspicious process name: {name}")
+
+    cmd_lower = cmdline.lower()
+    if "invoke-webrequest" in cmd_lower or "iex" in cmd_lower:
+        score += 0.35
+        reasons.append("download/execute in command line")
+    if "192.168." in cmd_lower and ":8080" in cmd_lower:
+        score += 0.30
+        reasons.append("C2 URL in command line")
+    if "-executionpolicy bypass" in cmd_lower:
+        score += 0.25
+        reasons.append("execution policy bypass")
+    if "-windowstyle hidden" in cmd_lower:
+        score += 0.20
+        reasons.append("hidden window style")
+    if "frombase64string" in cmd_lower:
+        score += 0.20
+        reasons.append("Base64 decode in command line")
+    if "currentversion\\run" in cmd_lower:
+        score += 0.20
+        reasons.append("registry Run key reference")
+    if "__eventfilter" in cmd_lower or "commandlineeventconsumer" in cmd_lower:
+        score += 0.20
+        reasons.append("WMI persistence reference")
+
+    flags = [m.group(0) for m in FLAG_PATTERN.finditer(cmdline)]
+    if flags:
+        score += 0.40
+        reasons.append("FLAG marker in command line")
+
+    techniques = _extract_techniques(cmdline)
+
+    score = min(1.0, round(score, 3))
+    detected = score >= 0.45
+
+    return {
+        "detected": detected,
+        "score": score,
+        "reasons": reasons,
+        "flags": flags,
+        "techniques": techniques,
+    }
+
+
+def compare_forensic_detection(strings_list: list[str],
+                               process_entry: dict = None) -> dict:
+    """Compare forensic string detection with process-level detection."""
+    strings_result = forensic_detect_strings(strings_list)
+    proc_result = forensic_detect_process(process_entry or {})
+    agreement = strings_result["detected"] == proc_result["detected"]
+    return {
+        "strings": strings_result,
+        "process": proc_result,
+        "agreement": agreement,
+    }
